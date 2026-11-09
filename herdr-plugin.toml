@@ -1,0 +1,15 @@
+id = "pandore.sleep"
+name = "Sleep"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Puts Claude agents quiet for a day to sleep: the tab shows a summary, Enter resumes the same session with the same flags."
+platforms = ["macos"]
+
+# Re-show the summary page in panes that slept before a Herdr restart, then make sure the hourly watcher runs.
+[[startup]]
+command = ["./herdr-sleep", "startup"]
+
+# [[startup]] runs only with a new server, so a focus change starts the watcher after install.
+[[events]]
+on = "pane.focused"
+command = ["./herdr-sleep", "ensure"]
