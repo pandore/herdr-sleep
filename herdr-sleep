@@ -888,10 +888,45 @@ def core_argv(name: str | None, cwd: str, argv: list[str], sid: str, labels: dic
     return cmd + ["--", "/bin/zsh", "-l", "-c", "exec " + shlex.join(argv + ["--resume", sid])]
 
 
+def core_pid() -> int | None:
+    if not core_running():
+        return None
+    out = subprocess.run([HC, "server", "status", "--json"], capture_output=True, text=True, timeout=20)
+    try:
+        return json.loads(out.stdout).get("pid")
+    except ValueError:
+        return None
+
+
+def attach(addr: str) -> int:
+    """Show a Herdr Core terminal in this pane. A core restart ends attach streams: attach again then.
+    Ctrl-\\ (detach) with the same core running, or the terminal ending, gives the pane back."""
+    while True:
+        for _ in range(60):  # a restarting core is back within seconds
+            if core_running():
+                break
+            time.sleep(1)
+        else:
+            print(f"Herdr Core не працює. Показати агента знову: herdr-sleep attach {addr}")
+            return 1
+        before = core_pid()
+        subprocess.run([HC, "attach", addr])
+        time.sleep(1.5)
+        after = core_pid()
+        if after is None or after != before:
+            continue  # the core restarted or is restarting
+        got = subprocess.run([HC, "get", addr, "--json"], capture_output=True, text=True, timeout=20)
+        if got.returncode != 0 or json.loads(got.stdout).get("state") != "live":
+            return 0  # the agent ended
+        print(f"\nВід'єднано. Агент працює далі в Herdr Core. Показати знову: herdr-sleep attach {addr}")
+        return 0
+
+
 def wake_in_core(rec: dict, sid: str) -> str:
     """Resume a slept session in Herdr Core; returns the terminal to attach to."""
-    out = subprocess.run(core_argv(rec.get("name"), rec["cwd"], rec["argv"], sid), capture_output=True, text=True,
-                         timeout=60)
+    labels = {"classic_pane": os.environ.get("HERDR_PANE_ID") or rec["pane_id"]}
+    out = subprocess.run(core_argv(rec.get("name"), rec["cwd"], rec["argv"], sid, labels), capture_output=True,
+                         text=True, timeout=60)
     if out.returncode != 0:
         raise RuntimeError((out.stderr or out.stdout).strip()[:200] or f"hc run exit {out.returncode}")
     t = json.loads(out.stdout)
@@ -981,7 +1016,7 @@ def page(sid: str) -> int:
             save(data)
         log(f"woke {rec.get('name') or pane} {sid} in Herdr Core as {addr}")
         try:
-            os.execv(HC, [HC, "attach", addr])  # this pane now shows the agent that runs in Core
+            os.execv(sys.executable, [sys.executable, SELF, "attach", addr])  # this pane now shows the agent in Core
         except OSError as exc:
             print(f"Агент працює в Herdr Core ({addr}), але показати його тут не вдалося: {exc}\nВручну: hc attach {addr}")
             return 1
@@ -1134,6 +1169,8 @@ def main(argv: list[str]) -> int:
         return page(args[0])
     if cmd == "after-wake" and len(args) == 2:
         return after_wake(*args)
+    if cmd == "attach" and len(args) == 1:
+        return attach(args[0])
     if cmd == "check" and len(args) == 1:  # before resuming a session by hand: is it live anywhere?
         problem = wake_problem({"cwd": "/"}, args[0])
         print(problem or "ok")
