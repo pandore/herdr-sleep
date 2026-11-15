@@ -238,5 +238,114 @@ class WhyAwake(unittest.TestCase):
             hs.EXCLUDE_CWDS.discard(self.cwd)
 
 
+
+
+class LiveElsewhere(unittest.TestCase):
+    """Waking must not start a second copy of a session that already runs elsewhere (another claude, Herdr Core)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = {"SESSIONS": hs.SESSIONS, "agents_now": hs.agents_now, "run": hs.subprocess.run,
+                      "core_running": hs.core_running}
+        hs.core_running = lambda: self.core
+        hs.SESSIONS = Path(self.tmp.name)
+        self.ps, self.core, self.terminals, self.hc_fails, self.calls = "claude --resume x", False, [], False, []
+        self.lstart = "Sun Nov 15 21:17:54 2026"
+
+        def fake_run(argv, **kw):
+            self.calls.append(os.path.basename(argv[0]))
+            r = hs.subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[0] == "ps":
+                r.stdout = self.ps if "command=" in argv else self.lstart
+            else:  # hc ls --json
+                r.returncode, r.stdout = (1 if self.hc_fails else 0), json.dumps({"terminals": self.terminals})
+                if kw.get("check") and r.returncode:
+                    raise hs.subprocess.CalledProcessError(r.returncode, argv)
+            return r
+        hs.subprocess.run = fake_run
+
+    def tearDown(self):
+        hs.SESSIONS, hs.agents_now, hs.subprocess.run = self.saved["SESSIONS"], self.saved["agents_now"], self.saved["run"]
+        hs.core_running = self.saved["core_running"]
+        self.tmp.cleanup()
+
+    def session_file(self, pid, sid=SID, raw=None):
+        (hs.SESSIONS / f"{pid}.json").write_text(raw if raw is not None else json.dumps({"pid": pid, "sessionId": sid}))
+
+    def test_live_claude_process_holds_the_session(self):
+        self.session_file(os.getpid())
+        self.assertEqual(hs.live_elsewhere(SID), f"процес {os.getpid()}")
+        self.ps = "/usr/bin/python3 something"  # the pid was reused by another program
+        self.assertIsNone(hs.live_elsewhere(SID))
+
+    def test_stale_other_and_broken_files_do_not_count(self):
+        dead = hs.subprocess.Popen(["true"])
+        dead.wait()
+        self.session_file(dead.pid)
+        self.session_file(os.getpid(), sid="99999999-2222-4333-8444-555555555555")
+        (hs.SESSIONS / "leftover.json").write_text("{broken")
+        self.session_file(2, raw="[1, 2]")
+        self.assertIsNone(hs.live_elsewhere(SID))
+        self.assertNotIn("hc", self.calls)  # no core running: never call hc, it would start one
+
+    def test_herdr_core_terminal_with_the_session_label(self):
+        self.core = True
+        self.terminals = [{"address": "t1", "name": "other", "labels": {"claude_session": "x"}},
+                          {"address": "t2", "name": "build-limb-community-owner", "labels": {"claude_session": SID}}]
+        self.assertEqual(hs.live_elsewhere(SID), "термінал Herdr Core build-limb-community-owner")
+        self.terminals = [{"address": "t3", "labels": {"claude_session": SID}}]
+        self.assertEqual(hs.live_elsewhere(SID), "термінал Herdr Core t3")  # unnamed: its address
+        self.terminals = [{"address": "t4"}]
+        self.assertIsNone(hs.live_elsewhere(SID))
+        self.session_file(os.getpid())  # core up and a live claude: the process wins, hc is not needed
+        self.assertEqual(hs.live_elsewhere(SID), f"процес {os.getpid()}")
+
+    def test_same_pid_later_process_does_not_count(self):
+        (hs.SESSIONS / f"{os.getpid()}.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": SID, "procStart": "Mon Nov  9 10:00:00 2026"}))
+        self.assertIsNone(hs.live_elsewhere(SID))  # ps says the pid started later: another claude
+        self.lstart = "Mon Nov 9 10:00:00 2026"
+        self.assertEqual(hs.live_elsewhere(SID), f"процес {os.getpid()}")
+
+    def test_unreadable_file_of_a_live_claude_fails_closed(self):
+        (hs.SESSIONS / f"{os.getpid()}.json").write_text("{half")
+        with self.assertRaises(RuntimeError):
+            hs.live_elsewhere(SID)
+        self.ps = "/usr/bin/python3 x"  # not claude: a broken leftover is ignored
+        self.assertIsNone(hs.live_elsewhere(SID))
+
+    def test_wake_refuses_when_running_elsewhere_or_unsure(self):
+        hs.agents_now = lambda: []
+        rec = {"cwd": self.tmp.name}
+        self.assertIsNone(hs.wake_problem(rec, SID))
+        self.session_file(os.getpid())
+        self.assertIn(f"процес {os.getpid()}", hs.wake_problem(rec, SID))
+        (hs.SESSIONS / f"{os.getpid()}.json").unlink()
+        self.core, self.hc_fails = True, True
+        self.assertIn("Не вдалося перевірити", hs.wake_problem(rec, SID))  # fails closed
+
+
+class CoreArgv(unittest.TestCase):
+    def test_resume_line_for_herdr_core(self):
+        cmd = hs.core_argv("build-x", "/tmp/a b", ["claude", "--permission-mode", "auto"], SID, {"classic_pane": "w4:p8"})
+        self.assertEqual(cmd[1:7], ["run", "--bg", "--no-parent", "--json", "--cwd", "/tmp/a b"])
+        self.assertIn(f"claude_session={SID}", cmd)
+        self.assertIn("classic_pane=w4:p8", cmd)
+        self.assertEqual(cmd[cmd.index("--name") + 1], "build-x")
+        self.assertEqual(cmd[-5:-1], ["--", "/bin/zsh", "-l", "-c"])
+        self.assertEqual(cmd[-1], f"exec claude --permission-mode auto --resume {SID}")
+        bad = hs.core_argv("Bad Name!", "/tmp", ["claude"], SID)  # hc would refuse it: a fixed name instead
+        self.assertEqual(bad[bad.index("--name") + 1], "s-11111111")
+        self.assertNotIn("--keep", cmd)
+
+    def test_core_running_needs_a_listening_socket(self):
+        saved = hs.CORE_SOCKET
+        try:
+            hs.CORE_SOCKET = Path("/nonexistent/core.sock")
+            self.assertFalse(hs.core_running())
+        finally:
+            hs.CORE_SOCKET = saved
+
+
 if __name__ == "__main__":
     unittest.main()

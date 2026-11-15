@@ -28,6 +28,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import textwrap
@@ -72,6 +73,9 @@ MARK = "💤 "
 STATE = Path(os.path.expanduser("~/.local/state/herdr-sleep"))
 JOURNAL = STATE / "sleeping.json"
 PROJECTS = Path(os.path.expanduser("~/.claude/projects"))
+SESSIONS = Path(os.path.expanduser("~/.claude/sessions"))  # Claude's own record of each running claude
+CORE_SOCKET = Path(os.environ.get("HC_SOCKET") or os.path.expanduser("~/.local/state/herdr-core/default/default.sock"))
+HC = shutil.which("hc") or os.path.expanduser("~/.local/bin/hc")
 SELF = os.path.realpath(__file__)
 SHELLS = {"zsh", "bash", "sh", "fish"}
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -809,6 +813,89 @@ def show(rec: dict, sid: str, actions: list[dict]) -> None:
     sys.stdout.flush()
 
 
+def core_running() -> bool:
+    """A Herdr Core answers on its socket. Ask this before any hc call: hc starts a core when none runs."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2)
+    try:
+        s.connect(str(CORE_SOCKET))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def ps_field(pid: int, field: str) -> str:
+    out = subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return " ".join(out.split())
+
+
+def core_ok() -> bool:
+    """A core that agents can live in: it answers, and launchd started it in the login session (Keychain, PATH).
+    A core started over SSH (the phone after a reboot) runs without --hc-launchd and claude there cannot log in."""
+    if not core_running():
+        return False
+    out = subprocess.run(["ps", "-axo", "args="], capture_output=True, text=True).stdout
+    return any(" --hc-launchd " in f" {line} " for line in out.splitlines())
+
+
+def live_elsewhere(sid: str) -> str | None:
+    """Where the session already runs outside this Herdr: a live claude process or a Herdr Core terminal."""
+    for f in SESSIONS.glob("*.json"):
+        d = None
+        for _ in range(2):  # claude may be writing the file right now
+            try:
+                d = json.loads(f.read_text())
+                break
+            except FileNotFoundError:
+                break  # the process ended and removed it
+            except (OSError, ValueError):
+                time.sleep(0.05)
+        if d is None:
+            if f.stem.isdigit() and alive(int(f.stem)) and "claude" in ps_field(int(f.stem), "command"):
+                raise RuntimeError(f"cannot read {f}")  # fail closed: a live claude whose session we cannot tell
+            continue
+        if not isinstance(d, dict):
+            continue
+        pid = d.get("pid")
+        if d.get("sessionId") != sid or not isinstance(pid, int) or not alive(pid):
+            continue
+        if "claude" not in ps_field(pid, "command"):
+            continue  # a stale file whose pid now belongs to another program
+        if d.get("procStart") and ps_field(pid, "lstart") != " ".join(str(d["procStart"]).split()):
+            continue  # same pid, a later claude: not this session's process
+        return f"процес {pid}"
+    if core_running():
+        out = subprocess.run([HC, "ls", "--json"], capture_output=True, text=True, timeout=20, check=True).stdout
+        for t in json.loads(out).get("terminals") or []:
+            if (t.get("labels") or {}).get("claude_session") == sid:
+                return f"термінал Herdr Core {t.get('name') or t.get('address')}"
+    return None
+
+
+def core_argv(name: str | None, cwd: str, argv: list[str], sid: str, labels: dict | None = None) -> list[str]:
+    """hc run line that resumes a claude session in Herdr Core, outliving whoever starts it."""
+    # No --keep: after a reboot a kept terminal returns as a shell holding the name and label, blocking the resume.
+    cmd = [HC, "run", "--bg", "--no-parent", "--json", "--cwd", cwd, "--label", f"claude_session={sid}"]
+    for k, v in (labels or {}).items():
+        cmd += ["--label", f"{k}={v}"]
+    # A name is unique among live terminals: it stops a second copy if Enter is pressed twice during a slow resume.
+    cmd += ["--name", name if name and re.fullmatch(r"[a-z0-9_-]{1,32}", name) else f"s-{sid[:8]}"]
+    # A login shell: launchd gives the core a bare PATH, so plain `claude` would not be found.
+    return cmd + ["--", "/bin/zsh", "-l", "-c", "exec " + shlex.join(argv + ["--resume", sid])]
+
+
+def wake_in_core(rec: dict, sid: str) -> str:
+    """Resume a slept session in Herdr Core; returns the terminal to attach to."""
+    out = subprocess.run(core_argv(rec.get("name"), rec["cwd"], rec["argv"], sid), capture_output=True, text=True,
+                         timeout=60)
+    if out.returncode != 0:
+        raise RuntimeError((out.stderr or out.stdout).strip()[:200] or f"hc run exit {out.returncode}")
+    t = json.loads(out.stdout)
+    return t.get("name") or t["address"]
+
+
 def wake_problem(rec: dict, sid: str) -> str | None:
     try:
         agents = agents_now()
@@ -817,6 +904,12 @@ def wake_problem(rec: dict, sid: str) -> str | None:
     other = next((x.get("pane_id") for x in agents if session_of(x) == sid and x.get("agent") == "claude"), None)
     if other:
         return f"Ця розмова вже відкрита в панелі {other}."
+    try:
+        where = live_elsewhere(sid)
+    except Exception:  # fail closed: a second copy of the same session is worse than one more Enter
+        return "Не вдалося перевірити, чи розмова вже відкрита деінде. Натисни Enter ще раз."
+    if where:
+        return f"Ця розмова вже відкрита: {where}."
     if not os.path.isdir(rec["cwd"]):
         return f"Теки {rec['cwd']} більше немає."
     return None
@@ -835,7 +928,19 @@ def page(sid: str) -> int:
     except Exception:  # the page must show even when the transcript cannot be read
         actions = []
     show(rec, sid, actions)
-    signal.signal(signal.SIGWINCH, lambda *_: show(rec, sid, actions))  # refit when the pane is resized
+    drawing = []
+
+    def redraw(*_):  # refit when the pane is resized; a resize during a redraw must not re-enter it
+        if drawing:
+            return
+        drawing.append(1)
+        try:
+            show(rec, sid, actions)
+        except Exception:
+            pass
+        finally:
+            drawing.clear()
+    signal.signal(signal.SIGWINCH, redraw)
     while True:
         try:
             line = input()
@@ -846,13 +951,38 @@ def page(sid: str) -> int:
         if line.strip():
             print("Текст не надіслано агенту. Натисни Enter без тексту, щоб продовжити.")
             continue
-        problem = wake_problem(rec, sid)
-        if not problem:
-            break
-        print(problem)
-    if not transcript(sid) and Path(rec["backup"]).exists():
-        Path(rec["transcript"]).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(rec["backup"], rec["transcript"])
+        try:
+            problem = wake_problem(rec, sid)
+        except KeyboardInterrupt:
+            unclaim(pane)
+            print(f"\nЛишаю звичайну оболонку. Продовжити вручну:\n  {resume_line(rec, sid)}")
+            return 130
+        if problem:
+            print(problem)
+            continue
+        if not transcript(sid) and Path(rec["backup"]).exists():
+            Path(rec["transcript"]).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(rec["backup"], rec["transcript"])
+        if not core_ok():
+            break  # no usable Herdr Core: wake here in classic Herdr, as before
+        try:
+            addr = wake_in_core(rec, sid)
+        except Exception as exc:  # nothing woken here; the next Enter re-checks whether Core started it after all
+            print(f"Не вдалося запустити в Herdr Core: {exc}. Натисни Enter ще раз.")
+            continue
+        unclaim(pane)
+        tab_id = ((herdr("pane", "get", pane, check=False) or {}).get("pane") or {}).get("tab_id") or rec.get("tab_id")
+        with locked():
+            data = load()
+            data.pop(sid, None)
+            unmark_tab(tab_id, data, sid)
+            save(data)
+        log(f"woke {rec.get('name') or pane} {sid} in Herdr Core as {addr}")
+        try:
+            os.execv(HC, [HC, "attach", addr])  # this pane now shows the agent that runs in Core
+        except OSError as exc:
+            print(f"Агент працює в Herdr Core ({addr}), але показати його тут не вдалося: {exc}\nВручну: hc attach {addr}")
+            return 1
     unclaim(pane)  # a stale claim would outrank Herdr's own detection of the resumed claude
     tab_id = ((herdr("pane", "get", pane, check=False) or {}).get("pane") or {}).get("tab_id") or rec.get("tab_id")
     with locked():
@@ -903,7 +1033,7 @@ def rearm() -> None:
     for sid, rec in data.items():
         pane = rec["pane_id"]
         info = (herdr("pane", "get", pane, check=False) or {}).get("pane")
-        if not info or pane in agents:
+        if not info or (pane in agents and agents[pane].get("agent") != LABEL):  # our own sleeping row is no agent
             continue
         if os.path.realpath(info.get("foreground_cwd") or info.get("cwd") or "/") != rec["cwd"]:
             continue
@@ -1002,6 +1132,10 @@ def main(argv: list[str]) -> int:
         return page(args[0])
     if cmd == "after-wake" and len(args) == 2:
         return after_wake(*args)
+    if cmd == "check" and len(args) == 1:  # before resuming a session by hand: is it live anywhere?
+        problem = wake_problem({"cwd": "/"}, args[0])
+        print(problem or "ok")
+        return 1 if problem else 0
     print(__doc__)
     return 2
 
