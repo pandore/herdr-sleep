@@ -73,6 +73,12 @@ class PermissionMode(unittest.TestCase):
 
 
 class Composer(unittest.TestCase):
+    def test_titled_top_border(self):
+        titled = "\x1b[0m\x1b[38;2;136;136;136m" + "─" * 40 + " ultracode ─\x1b[0m"
+        screen = "\n".join(["reply", titled, "❯\xa0", RULE, FOOTER])
+        self.assertEqual(hs.composer_state(screen), "empty")
+        self.assertEqual(hs.composer_state(screen.replace("❯\xa0", "❯\xa0текст")), "draft")
+
     def test_states(self):
         self.assertEqual(hs.composer_state(composer("❯\xa0")), "empty")
         self.assertEqual(hs.composer_state(composer("❯\xa0\x1b[0m\x1b[2mперевірив пошту, все ок\x1b[0m")), "empty")
@@ -257,8 +263,11 @@ class LiveElsewhere(unittest.TestCase):
             r = hs.subprocess.CompletedProcess(argv, 0, "", "")
             if argv[0] == "ps":
                 r.stdout = self.ps if "command=" in argv else self.lstart
-            else:  # hc ls --json
-                r.returncode, r.stdout = (1 if self.hc_fails else 0), json.dumps({"terminals": self.terminals})
+            else:  # hc ls --label claude_session=<sid> --json: hc filters, and shows no labels
+                want = dict(argv[argv.index("--label") + 1].split("=", 1) for _ in [0]) if "--label" in argv else {}
+                hits = [{k: v for k, v in t.items() if k != "labels"} for t in self.terminals
+                        if all((t.get("labels") or {}).get(k) == v for k, v in want.items())]
+                r.returncode, r.stdout = (1 if self.hc_fails else 0), json.dumps({"terminals": hits})
                 if kw.get("check") and r.returncode:
                     raise hs.subprocess.CalledProcessError(r.returncode, argv)
             return r

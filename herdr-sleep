@@ -81,6 +81,7 @@ SHELLS = {"zsh", "bash", "sh", "fish"}
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 RULE = re.compile(r"^─{10,}$")
+TITLED_RULE = re.compile(r"^─{10,} .+ ─+$")  # the composer's top border may carry a session label
 
 # Claude launch options we know how to replay; anything else refuses (an unknown arity could turn a prompt into a value).
 BOOL_FLAGS = {"--allow-dangerously-skip-permissions", "--dangerously-skip-permissions", "--verbose",
@@ -500,7 +501,7 @@ def composer_state(text: str | None) -> str:
     for i in range(len(lines) - 1, 0, -1):
         if plain[i].startswith("❯"):
             end = next((j for j in range(i + 1, len(lines)) if RULE.match(plain[j])), None)
-            if end is None or not RULE.match(plain[i - 1]):
+            if end is None or not (RULE.match(plain[i - 1]) or TITLED_RULE.match(plain[i - 1])):
                 return "unknown"
             body = re.sub(r"\x1b\[2m[^\x1b]*", "", "\n".join(lines[i:end]))
             rest = ANSI.sub("", body).replace("❯", "", 1).replace("\xa0", " ").strip()
@@ -867,10 +868,11 @@ def live_elsewhere(sid: str) -> str | None:
             continue  # same pid, a later claude: not this session's process
         return f"процес {pid}"
     if core_running():
-        out = subprocess.run([HC, "ls", "--json"], capture_output=True, text=True, timeout=20, check=True).stdout
+        # `hc ls` shows no labels; it filters by them.
+        out = subprocess.run([HC, "ls", "--label", f"claude_session={sid}", "--json"], capture_output=True, text=True,
+                             timeout=20, check=True).stdout
         for t in json.loads(out).get("terminals") or []:
-            if (t.get("labels") or {}).get("claude_session") == sid:
-                return f"термінал Herdr Core {t.get('name') or t.get('address')}"
+            return f"термінал Herdr Core {t.get('name') or t.get('address')}"
     return None
 
 
