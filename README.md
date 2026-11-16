@@ -113,13 +113,24 @@ herdr-sleep sleep-pane PANE   sleep one agent now (skips the quiet-time and focu
 herdr-sleep list              sleeping sessions and their manual resume commands
 herdr-sleep refresh           redraw every sleeping page with the current code
 herdr-sleep sweep             one pass now
+herdr-sleep check SID         is this session live anywhere (a claude process or a Herdr Core terminal)?
+herdr-sleep attach NAME       show a Herdr Core terminal in this pane; re-attach after a core restart
 ```
 
 To wake a pane from a script or another agent: `herdr pane send-keys <pane> enter`.
 
+## Herdr Core
+
+When a [Herdr Core](https://herdr.dev) (`hc`) runs on the machine, started by launchd in the login session, the plugin works across both:
+
+- **Waking.** Enter on a sleeping page resumes the session in Herdr Core (`hc run --bg --no-parent`, label `claude_session=<sid>`, a login shell so `claude` is on PATH). The same classic pane then shows it through `herdr-sleep attach`. Without a usable core, it wakes in classic Herdr as before.
+- **Sleeping.** A claude in Core that is shown in a classic pane (label `classic_pane=<pane>`) sleeps by the same rules: idle or done, quiet for `idle_hours`, empty composer, no background command or Claude background job, not focused, cwd not excluded. Its page goes to that classic pane.
+- **Safety.** Before any wake it checks that the session runs nowhere: no live claude holds it in `~/.claude/sessions` (pid and start time), and no Core terminal carries its label. It asks Core only after a socket connect succeeds, because any `hc` call starts a core.
+
 ## Limits
 
 - Claude Code only. Other agent kinds are left alone.
+- Herdr Core support is tested on hc 0.1.21 on macOS; `hc ls` shows no labels, so the plugin filters with `--label`.
 - Depends on Herdr's CLI fields (`agent_session`, `foreground_cwd`, `state_change_seq`) and on Claude Code's transcript format and footer text; a change there makes agents stay awake, not break.
 - A small window remains between the last check and `SIGTERM`; Claude discards an unsent draft on exit, which is why a non-empty composer is a hard stop.
 - The project lines are written when the agent falls asleep and do not follow later changes to the project.
