@@ -498,3 +498,22 @@ class ClassicState(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoreClaudes(unittest.TestCase):
+    """Another machine's terminals (`hc machine add`) show in `hc ls` as machine/tN: never ours to put to sleep."""
+
+    def test_skips_other_machines(self):
+        saved = hs.core_ok, hs.core_running, hs.subprocess.run
+        ls = {"terminals": [{"address": "t1", "agent": "claude-code", "state": "live"},
+                            {"address": "hub/t1s", "agent": "claude-code", "state": "live"}]}
+
+        def fake_run(argv, **kw):
+            out = json.dumps(ls) if argv[1] == "ls" else json.dumps({"address": argv[2]})
+            return hs.subprocess.CompletedProcess(argv, 0, out, "")
+        hs.core_ok = hs.core_running = lambda: True
+        hs.subprocess.run = fake_run
+        try:
+            self.assertEqual([t["address"] for t in hs.core_claudes()], ["t1"])
+        finally:
+            hs.core_ok, hs.core_running, hs.subprocess.run = saved

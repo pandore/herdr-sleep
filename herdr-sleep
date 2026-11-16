@@ -975,6 +975,8 @@ def core_claudes() -> list[dict]:
     for t in json.loads(out).get("terminals") or []:
         if t.get("agent") != "claude-code" or t.get("state") != "live":
             continue
+        if "/" in t["address"]:  # another machine's terminal (`hc machine add`): its pids and transcripts are not ours
+            continue
         if not core_running():
             return []
         got = subprocess.run([HC, "get", t["address"], "--json"], capture_output=True, text=True, timeout=20)
