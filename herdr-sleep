@@ -557,15 +557,110 @@ def why_awake(a: dict, agents: list[dict], tabs: dict, manual: bool = False) -> 
     argv, err = replay_argv(claudes[0].get("argv"))
     if err:
         return err, None
+    started = started_hours_ago(pid)
+    if not manual and started is not None and started < IDLE_HOURS:
+        return f"woken {started:.1f} h ago", None  # a resume adds no turn, so the transcript alone looks quiet
     busy = busy_children(pid, procs)
     if busy:
         return f"background command: {busy[0]}", None
+    if background_job(sid, pid):
+        return "background Claude job", None  # its session lives on in Claude's daemon: the page could never wake it
     text = screen(a["pane_id"])
     state = composer_state(text)
     if state != "empty":
         return f"composer {state}", None
     return None, {"pid": pid, "argv": argv, "sid": sid, "cwd": cwd, "transcript": path, "tab": tab,
                   "quiet": quiet, "rss": tree_rss_mb(pid, procs), "mode": screen_mode(text)}
+
+
+def started_hours_ago(pid: int) -> float | None:
+    """When this claude started, from its own ~/.claude/sessions record. `ps` is no use: a woken claude is exec'd
+    by the page process and keeps its pid and start time."""
+    try:
+        d = json.loads((SESSIONS / f"{pid}.json").read_text())
+        return (time.time() * 1000 - int(d["startedAt"])) / 3.6e6
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def pane_argvs(pane: str) -> list[list[str]]:
+    info = (herdr("pane", "process-info", "--pane", pane, check=False) or {}).get("process_info") or {}
+    return [p.get("argv") or [] for p in info.get("foreground_processes") or []]
+
+
+def background_job(sid: str, pid: int) -> bool:
+    """Claude Code's own background agents keep a session in a daemon: stopping the visible claude does not end it."""
+    for f in SESSIONS.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        if d.get("sessionId") == sid and d.get("kind") == "bg" and isinstance(d.get("pid"), int) and alive(d["pid"]):
+            return True
+        if d.get("pid") == pid and (d.get("parkedJobId") or d.get("sessionId") not in (None, sid)):
+            return True
+    return False
+
+
+def why_awake_core(t: dict, tabs: dict, manual: bool = False) -> tuple[str | None, dict | None]:
+    """The same checks as why_awake for a claude in Herdr Core shown in a classic pane. Fails closed."""
+    labels = t.get("labels") or {}
+    sid, pane, name = labels.get("claude_session"), labels.get("classic_pane"), t.get("name") or t.get("address")
+    if not sid or not pane:
+        return "no claude_session or classic_pane label", None
+    status = (t.get("status") or {}).get("state")
+    if status not in ("idle", "done"):
+        return f"status {status}", None
+    fg = t.get("foreground") or {}
+    if os.path.basename((fg.get("argv") or [""])[0]) != "claude" or not isinstance(fg.get("pid"), int):
+        return "claude process not identified", None
+    info = (herdr("pane", "get", pane, check=False) or {}).get("pane")
+    if not info:
+        return "classic pane gone", None
+    tab = tabs.get(info.get("tab_id")) or {}
+    if not manual and (info.get("focused") or tab.get("focused")):
+        return "focused", None
+    if not any(a[-2:] == ["attach", name] for a in pane_argvs(pane)):
+        return "not shown in its classic pane", None  # the page needs that pane
+    cwd = os.path.realpath(fg.get("cwd") or t.get("cwd") or "/")
+    if cwd in EXCLUDE_CWDS:
+        return "excluded", None
+    path = transcript(sid)
+    if not path:
+        return "no transcript", None
+    if path.parent.name != project_dir_name(cwd):
+        return "transcript belongs to another folder", None
+    quiet = last_turn_age_hours(path)
+    if quiet is None:
+        return "no conversation turns yet", None
+    if not manual and quiet < IDLE_HOURS:
+        return f"quiet {quiet:.1f} h", None
+    pid = fg["pid"]
+    if t.get("keep") or t.get("pid") not in (None, pid):
+        return "kept or shell-hosted terminal", None  # SIGTERM would leave a live shell holding the session label
+    created = (time.time() * 1000 - t["created_ms"]) / 3.6e6 if t.get("created_ms") else None
+    started = min(x for x in (created, started_hours_ago(pid), 1e9) if x is not None)
+    if not manual and started < IDLE_HOURS:
+        return f"woken {started:.1f} h ago", None
+    argv, err = replay_argv(fg.get("argv"))
+    if err:
+        return err, None
+    procs = ps_table()
+    busy = busy_children(pid, procs)
+    if busy:
+        return f"background command: {busy[0]}", None
+    if background_job(sid, pid):
+        return "background Claude job", None
+    text = screen(pane)  # the classic pane mirrors the Core screen, with colours
+    state = composer_state(text)
+    if state != "empty":
+        return f"composer {state}", None
+    return None, {"pid": pid, "argv": argv, "sid": sid, "cwd": cwd, "transcript": path, "tab": tab, "pane": pane,
+                  "tab_id": info.get("tab_id"), "workspace_id": info.get("workspace_id"), "name": name,
+                  "status_ms": t.get("status_ms"), "quiet": quiet, "rss": tree_rss_mb(pid, procs),
+                  "mode": screen_mode(text)}
 
 
 # --- State ---------------------------------------------------------------------------------
@@ -647,29 +742,86 @@ def show_page(pane: str, sid: str) -> None:
 # --- Sleep ---------------------------------------------------------------------------------
 
 def sleep_pane(a: dict, agents: list[dict], tabs: dict, manual: bool = False) -> str | None:
-    """Sleep one agent. Returns why it stayed awake, or None once it sleeps."""
+    """Sleep one classic agent. Returns why it stayed awake, or None once it sleeps."""
     reason, f = why_awake(a, agents, tabs, manual)
     if reason:
         return reason
-    pane, sid = a["pane_id"], f["sid"]
+    pane = a["pane_id"]
+
+    def recheck():
+        fresh = next((x for x in agents_now() if x.get("pane_id") == pane), None)
+        if not fresh or fresh.get("state_change_seq") != a.get("state_change_seq") or session_of(fresh) != f["sid"]:
+            return "changed while summarising", None
+        r, f2 = why_awake(fresh, agents_now(), {t["tab_id"]: t for t in herdr("tab", "list")["tabs"]}, manual)
+        return (r or "process changed", None) if r or f2["pid"] != f["pid"] else (None, f2)
+
+    def exited():  # Herdr ignores a claim made before it has noticed the exit
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if not any(x.get("pane_id") == pane and x.get("agent") == "claude" for x in agents_now()):
+                break
+            time.sleep(1)
+        return True
+
+    return put_to_sleep(pane, a.get("tab_id"), a.get("name"), a.get("workspace_id"), f, recheck, exited)
+
+
+def sleep_core(t: dict, tabs: dict, manual: bool = False) -> str | None:
+    """Sleep one claude that runs in Herdr Core; its page goes to the classic pane that showed it."""
+    reason, f = why_awake_core(t, tabs, manual)
+    if reason:
+        return reason
+    addr = f["name"]
+
+    def recheck():
+        if not core_ok():
+            return "Herdr Core not running", None
+        got = subprocess.run([HC, "get", addr, "--json"], capture_output=True, text=True, timeout=20)
+        if got.returncode != 0:
+            return "terminal gone", None
+        fresh = json.loads(got.stdout)
+        if fresh.get("status_ms") != f["status_ms"]:
+            return "changed while summarising", None
+        r, f2 = why_awake_core(fresh, {x["tab_id"]: x for x in herdr("tab", "list")["tabs"]}, manual)
+        return (r or "process changed", None) if r or f2["pid"] != f["pid"] else (None, f2)
+
+    def exited():  # the pane's attach returns once the terminal ends; free the name, then the pane is a shell
+        try:
+            if core_running():
+                subprocess.run([HC, "rm", addr], capture_output=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            pass
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                argvs = pane_argvs(f["pane"])
+            except Exception:
+                argvs = []
+            if argvs and all(os.path.basename((a or ["?"])[0]).lstrip("-") in SHELLS for a in argvs):
+                return True
+            time.sleep(1)
+        return False
+
+    return put_to_sleep(f["pane"], f["tab_id"], f["name"], f["workspace_id"], f, recheck, exited)
+
+
+def put_to_sleep(pane: str, tab_id: str | None, name: str | None, workspace_id: str | None, f: dict,
+                 recheck, exited) -> str | None:
+    sid = f["sid"]
     msgs = messages(f["transcript"])
-    place = place_of(a.get("workspace_id"), f["tab"].get("label") or "")
+    place = place_of(workspace_id, f["tab"].get("label") or "")
     summary = summarize(msgs, f["tab"].get("label") or "", f["cwd"]) or last_recap(f["transcript"])
     project = project_context(msgs, f["cwd"], place)
     # Re-check everything: the summary took a while and the user may have come back.
-    fresh = next((x for x in agents_now() if x.get("pane_id") == pane), None)
-    if not fresh or fresh.get("state_change_seq") != a.get("state_change_seq") or session_of(fresh) != sid:
-        return "changed while summarising"
-    tabs = {t["tab_id"]: t for t in herdr("tab", "list")["tabs"]}
-    reason, f2 = why_awake(fresh, agents_now(), tabs, manual)
-    if reason or f2["pid"] != f["pid"]:
-        return reason or "process changed"
+    reason, f2 = recheck()
+    if reason:
+        return reason
 
     backup = STATE / "transcripts" / f"{sid}.jsonl"  # Claude deletes transcripts untouched for 30 days
     backup.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(f["transcript"], backup)
     last = lambda role: next((t for r, t in reversed(msgs) if r == role), "")
-    rec = {"pane_id": pane, "tab_id": a.get("tab_id"), "name": a.get("name"), "cwd": f["cwd"],
+    rec = {"pane_id": pane, "tab_id": tab_id, "name": name, "cwd": f["cwd"],
            "argv": with_mode(f2["argv"], f2["mode"] or last_permission_mode(f["transcript"])),
            "transcript": str(f["transcript"]), "backup": str(backup),
            "slept_at": datetime.now().strftime("%d.%m %H:%M"), "summary": summary,
@@ -689,19 +841,21 @@ def sleep_pane(a: dict, agents: list[dict], tabs: dict, manual: bool = False) ->
             data = load()
             data.pop(sid, None)
             save(data)
-        log(f"kept {a.get('name') or pane}: still running 30 s after SIGTERM")
+        log(f"kept {name or pane}: still running 30 s after SIGTERM")
         return "did not exit after SIGTERM"
-    # Herdr ignores a claim made before it has noticed the exit.
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        if not any(x.get("pane_id") == pane and x.get("agent") == "claude" for x in agents_now()):
-            break
-        time.sleep(1)
+    try:
+        shown = exited()
+    except Exception as exc:
+        shown = False
+        log(f"after sleeping {name or pane}: {exc!r}")
+    if not shown:
+        log(f"slept {name or pane} {sid} but its pane is busy; page not shown (record kept, rearm shows it later)")
+        return None
     claim(pane, rec)
     if rec["tab_id"]:
         mark_tab(rec["tab_id"])
     show_page(pane, sid)
-    log(f"slept {rec['name'] or pane} {sid} after {f['quiet']:.1f} h, ~{f['rss']} MB RSS")
+    log(f"slept {name or pane} {sid} after {f['quiet']:.1f} h, ~{f['rss']} MB RSS")
     return None
 
 
@@ -742,7 +896,36 @@ def sweep(dry_run: bool = False) -> int:
                 log(f"error on {name}: {exc!r}")
                 if dry_run:
                     print(f"{name:30} error {exc!r}")
+        for t in core_claudes():
+            name = t.get("name") or t.get("address")
+            try:
+                if dry_run:
+                    reason, f = why_awake_core(t, tabs)
+                    print(f"{name:30} {reason or 'would sleep (~%d MB RSS)' % f['rss']} [Core]")
+                else:
+                    sleep_core(t, tabs)
+            except Exception as exc:
+                log(f"error on Core {name}: {exc!r}")
+                if dry_run:
+                    print(f"{name:30} error {exc!r} [Core]")
     return 0
+
+
+def core_claudes() -> list[dict]:
+    """Live claude terminals in Herdr Core, in full (labels, foreground, status time). Empty without a usable core."""
+    if not core_ok():
+        return []
+    out = subprocess.run([HC, "ls", "--json"], capture_output=True, text=True, timeout=20, check=True).stdout
+    full = []
+    for t in json.loads(out).get("terminals") or []:
+        if t.get("agent") != "claude-code" or t.get("state") != "live":
+            continue
+        if not core_running():
+            return []
+        got = subprocess.run([HC, "get", t["address"], "--json"], capture_output=True, text=True, timeout=20)
+        if got.returncode == 0:
+            full.append(json.loads(got.stdout))
+    return full
 
 
 # --- Wake ----------------------------------------------------------------------------------
@@ -901,25 +1084,39 @@ def core_pid() -> int | None:
 def attach(addr: str) -> int:
     """Show a Herdr Core terminal in this pane. A core restart ends attach streams: attach again then.
     Ctrl-\\ (detach) with the same core running, or the terminal ending, gives the pane back."""
-    while True:
+    retries = 0
+    while retries <= 5:
         for _ in range(60):  # a restarting core is back within seconds
             if core_running():
                 break
             time.sleep(1)
         else:
-            print(f"Herdr Core не працює. Показати агента знову: herdr-sleep attach {addr}")
-            return 1
-        before = core_pid()
-        subprocess.run([HC, "attach", addr])
+            break
+        before, began = core_pid(), time.time()
+        rc = subprocess.run([HC, "attach", addr]).returncode
+        if time.time() - began > 30:
+            retries = 0  # it showed the agent for a while: count fresh
         time.sleep(1.5)
         after = core_pid()
-        if after is None or after != before:
-            continue  # the core restarted or is restarting
-        got = subprocess.run([HC, "get", addr, "--json"], capture_output=True, text=True, timeout=20)
-        if got.returncode != 0 or json.loads(got.stdout).get("state") != "live":
+        if before is None or after is None or after != before:
+            retries += 1
+            continue  # the core restarted or is restarting, or we cannot tell yet
+        try:
+            got = subprocess.run([HC, "get", addr, "--json"], capture_output=True, text=True, timeout=20)
+            live = got.returncode == 0 and json.loads(got.stdout).get("state") == "live"
+        except (subprocess.TimeoutExpired, ValueError):
+            retries += 1
+            continue
+        if not live:
             return 0  # the agent ended
+        if rc != 0:  # attach refused while the agent lives: try again a few times
+            retries += 1
+            time.sleep(retries)
+            continue
         print(f"\nВід'єднано. Агент працює далі в Herdr Core. Показати знову: herdr-sleep attach {addr}")
         return 0
+    print(f"Не вдалося показати агента. Агент, імовірно, працює далі в Herdr Core. Показати знову: herdr-sleep attach {addr}")
+    return 1
 
 
 def wake_in_core(rec: dict, sid: str) -> str:
@@ -927,10 +1124,36 @@ def wake_in_core(rec: dict, sid: str) -> str:
     labels = {"classic_pane": os.environ.get("HERDR_PANE_ID") or rec["pane_id"]}
     out = subprocess.run(core_argv(rec.get("name"), rec["cwd"], rec["argv"], sid, labels), capture_output=True,
                          text=True, timeout=60)
+    if out.returncode != 0 and rec.get("name") and "name" in (out.stderr + out.stdout).lower():
+        # another live terminal holds the name: use the session's own name, still unique per session
+        out = subprocess.run(core_argv(None, rec["cwd"], rec["argv"], sid, labels), capture_output=True, text=True,
+                             timeout=60)
     if out.returncode != 0:
         raise RuntimeError((out.stderr or out.stdout).strip()[:200] or f"hc run exit {out.returncode}")
     t = json.loads(out.stdout)
     return t.get("name") or t["address"]
+
+
+def core_terminal_of(sid: str) -> str | None:
+    """The live Core terminal that carries this session, if any. Call only when core_running()."""
+    out = subprocess.run([HC, "ls", "--label", f"claude_session={sid}", "--json"], capture_output=True, text=True,
+                         timeout=20, check=True).stdout
+    t = next(iter(json.loads(out).get("terminals") or []), None)
+    return (t.get("name") or t.get("address")) if t else None
+
+
+def confirm_core(addr: str) -> str | None:
+    """None once the Core terminal runs claude (or is still starting it after 20 s); else why it did not."""
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        got = subprocess.run([HC, "get", addr, "--json"], capture_output=True, text=True, timeout=20)
+        t = json.loads(got.stdout) if got.returncode == 0 else {}
+        if t.get("state") == "finished":
+            return f"завершився одразу (код {t.get('exit_code')})"
+        if os.path.basename(((t.get("foreground") or {}).get("argv") or [""])[0]) == "claude":
+            return None
+        time.sleep(1)
+    return None
 
 
 def wake_problem(rec: dict, sid: str) -> str | None:
@@ -950,6 +1173,17 @@ def wake_problem(rec: dict, sid: str) -> str | None:
     if not os.path.isdir(rec["cwd"]):
         return f"Теки {rec['cwd']} більше немає."
     return None
+
+
+def release(pane: str, rec: dict, sid: str) -> None:
+    """The session runs in Core now: drop the sleeping row, the 💤 and the record."""
+    unclaim(pane)
+    tab_id = ((herdr("pane", "get", pane, check=False) or {}).get("pane") or {}).get("tab_id") or rec.get("tab_id")
+    with locked():
+        data = load()
+        data.pop(sid, None)
+        unmark_tab(tab_id, data, sid)
+        save(data)
 
 
 def page(sid: str) -> int:
@@ -978,6 +1212,7 @@ def page(sid: str) -> int:
         finally:
             drawing.clear()
     signal.signal(signal.SIGWINCH, redraw)
+    core_tried = False
     while True:
         try:
             line = input()
@@ -988,6 +1223,14 @@ def page(sid: str) -> int:
         if line.strip():
             print("Текст не надіслано агенту. Натисни Enter без тексту, щоб продовжити.")
             continue
+        try:
+            adopted = core_terminal_of(sid) if core_running() else None
+        except Exception:
+            adopted = None
+        if adopted:  # it already runs in Core (a wake whose reply got lost, or someone moved it): show it here
+            release(pane, rec, sid)
+            log(f"showing {rec.get('name') or pane} {sid}, already in Herdr Core as {adopted}")
+            os.execv(sys.executable, [sys.executable, SELF, "attach", adopted])
         try:
             problem = wake_problem(rec, sid)
         except KeyboardInterrupt:
@@ -1001,19 +1244,21 @@ def page(sid: str) -> int:
             Path(rec["transcript"]).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(rec["backup"], rec["transcript"])
         if not core_ok():
+            if core_tried:  # Core may still be starting that wake: a classic wake now could make a second copy
+                print("Herdr Core перезапускається або не працює. Натисни Enter за кілька секунд.")
+                continue
             break  # no usable Herdr Core: wake here in classic Herdr, as before
+        core_tried = True
         try:
             addr = wake_in_core(rec, sid)
+            failed = confirm_core(addr)
         except Exception as exc:  # nothing woken here; the next Enter re-checks whether Core started it after all
             print(f"Не вдалося запустити в Herdr Core: {exc}. Натисни Enter ще раз.")
             continue
-        unclaim(pane)
-        tab_id = ((herdr("pane", "get", pane, check=False) or {}).get("pane") or {}).get("tab_id") or rec.get("tab_id")
-        with locked():
-            data = load()
-            data.pop(sid, None)
-            unmark_tab(tab_id, data, sid)
-            save(data)
+        if failed:
+            print(f"Агент у Herdr Core {failed}. Подивитися: hc read {addr}. Натисни Enter, щоб спробувати ще раз.")
+            continue
+        release(pane, rec, sid)
         log(f"woke {rec.get('name') or pane} {sid} in Herdr Core as {addr}")
         try:
             os.execv(sys.executable, [sys.executable, SELF, "attach", addr])  # this pane now shows the agent in Core
@@ -1081,6 +1326,16 @@ def rearm() -> None:
         claim(pane, rec)
         show_page(pane, sid)
         log(f"re-armed {rec.get('name') or pane} {sid}")
+    slept_panes = {r["pane_id"] for r in data.values()}
+    for t in core_claudes():  # after a classic restart, panes that showed Core agents are bare shells again
+        pane, name = (t.get("labels") or {}).get("classic_pane"), t.get("name") or t.get("address")
+        if not pane or pane in slept_panes or not (herdr("pane", "get", pane, check=False) or {}).get("pane"):
+            continue
+        argvs = pane_argvs(pane)
+        if not argvs or any(os.path.basename((a or ["?"])[0]).lstrip("-") not in SHELLS for a in argvs):
+            continue  # it shows something already, or we cannot tell
+        herdr("pane", "run", pane, f"{shlex.quote(SELF)} attach {shlex.quote(name)}", check=False)
+        log(f"re-attached {name} in {pane}")
 
 
 def ensure() -> int:
@@ -1154,11 +1409,12 @@ def main(argv: list[str]) -> int:
         with locked("sweep"):  # a concurrent sweep's forget_awake would drop the record before claude exits
             agents = agents_now()
             a = next((x for x in agents if x.get("pane_id") == args[0]), None)
-            if not a:
-                print(f"no agent in pane {args[0]}")
-                return 1
             tabs = {t["tab_id"]: t for t in herdr("tab", "list")["tabs"]}
-            reason = sleep_pane(a, agents, tabs, manual=True)
+            core = None if a else next((t for t in core_claudes() if args[0] in (t.get("name"), t.get("address"))), None)
+            if not a and not core:
+                print(f"no agent in pane {args[0]} and no Core terminal of that name")
+                return 1
+            reason = sleep_pane(a, agents, tabs, manual=True) if a else sleep_core(core, tabs, manual=True)
         print(reason or "asleep")
         return 1 if reason else 0
     if cmd == "list":

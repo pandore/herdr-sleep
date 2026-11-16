@@ -181,8 +181,10 @@ class WhyAwake(unittest.TestCase):
         project.mkdir(parents=True)
         self.path = project / f"{SID}.jsonl"
         self.write_turn(hours_ago=30)
-        self.saved = {k: getattr(hs, k) for k in ("PROJECTS", "herdr", "ps_table", "screen", "tree_rss_mb")}
+        self.saved = {k: getattr(hs, k) for k in ("PROJECTS", "SESSIONS", "herdr", "ps_table", "screen", "tree_rss_mb")}
         hs.PROJECTS = Path(self.tmp.name) / "projects"
+        hs.SESSIONS = Path(self.tmp.name) / "sessions"
+        hs.SESSIONS.mkdir()
         self.screen = composer("❯\xa0")
         self.procs = {50: (1, "-zsh"), 100: (50, "claude --allow-dangerously-skip-permissions"),
                       101: (100, "npm exec @playwright/mcp@latest")}
@@ -214,6 +216,15 @@ class WhyAwake(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertEqual(facts["argv"], ["claude", "--allow-dangerously-skip-permissions", "--effort", "max"])
         self.assertEqual(facts["pid"], 100)
+
+    def test_background_job_and_fresh_wake_stay_awake(self):
+        (hs.SESSIONS / "100.json").write_text(json.dumps({"pid": 100, "sessionId": "other", "parkedJobId": "x",
+                                                         "startedAt": int((time.time() - 30 * 3600) * 1000)}))
+        self.assertEqual(self.why(), "background Claude job")  # Claude's daemon holds the session: never sleep it
+        (hs.SESSIONS / "100.json").write_text(json.dumps({"pid": 100, "sessionId": SID,
+                                                         "startedAt": int((time.time() - 600) * 1000)}))
+        self.assertEqual(self.why(), "woken 0.2 h ago")  # a resume adds no turn; the transcript alone looks quiet
+        self.assertIsNone(self.why(manual=True))
 
     def test_stays_awake(self):
         self.assertEqual(self.why(tabs={"w8:t2": {"focused": True}}), "focused")
@@ -354,6 +365,84 @@ class CoreArgv(unittest.TestCase):
             self.assertFalse(hs.core_running())
         finally:
             hs.CORE_SOCKET = saved
+
+
+class CoreSleep(unittest.TestCase):
+    """A claude in Herdr Core shown in a classic pane sleeps by the same rules as a classic one."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cwd = os.path.realpath(self.tmp.name)
+        project = Path(self.tmp.name) / "projects" / hs.project_dir_name(self.cwd)
+        project.mkdir(parents=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 30 * 3600))
+        (project / f"{SID}.jsonl").write_text(json.dumps({"type": "user", "timestamp": stamp, "message": {"content": "x"}}, separators=(",", ":")) + "\n")
+        keys = ("PROJECTS", "SESSIONS", "herdr", "ps_table", "screen", "tree_rss_mb", "EXCLUDE_CWDS")
+        self.saved = {k: getattr(hs, k) for k in keys}
+        hs.PROJECTS, hs.SESSIONS = Path(self.tmp.name) / "projects", Path(self.tmp.name) / "sessions"
+        hs.SESSIONS.mkdir()
+        hs.EXCLUDE_CWDS = set()
+        self.shown = ["/x/herdr-sleep", "attach", "build-x"]
+        self.focused = False
+        def herdr(*a, **k):
+            if a[:2] == ("pane", "get"):
+                return {"pane": {"pane_id": "w4:p8", "tab_id": "w4:t8", "workspace_id": "w4", "focused": self.focused}}
+            if a[:2] == ("pane", "process-info"):
+                return {"process_info": {"foreground_processes": [{"argv": self.shown}]}}
+            return {}
+        hs.herdr = herdr
+        self.procs = {100: (1, "claude --allow-dangerously-skip-permissions")}
+        hs.ps_table = lambda: self.procs
+        self.screen = composer("❯\xa0")
+        hs.screen = lambda pane: self.screen
+        hs.tree_rss_mb = lambda pid, procs: 300
+        self.t = {"address": "t4", "name": "build-x", "labels": {"claude_session": SID, "classic_pane": "w4:p8"},
+                  "status": {"app": "claude-code", "state": "idle"}, "status_ms": 1,
+                  "foreground": {"pid": 100, "cwd": self.cwd, "argv": ["claude", "--allow-dangerously-skip-permissions",
+                                                                      "--resume", SID]}}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(hs, k, v)
+        self.tmp.cleanup()
+
+    def why(self, manual=False):
+        return hs.why_awake_core(self.t, {}, manual)[0]
+
+    def test_sleeps_a_quiet_core_claude_shown_in_its_pane(self):
+        reason, f = hs.why_awake_core(self.t, {})
+        self.assertIsNone(reason)
+        self.assertEqual((f["pane"], f["name"], f["pid"]), ("w4:p8", "build-x", 100))
+        self.assertEqual(f["argv"], ["claude", "--allow-dangerously-skip-permissions"])  # resume flag dropped
+
+    def test_stays_awake(self):
+        self.focused = True
+        self.assertEqual(self.why(), "focused")
+        self.assertIsNone(self.why(manual=True))
+        self.focused = False
+        self.t["status"] = {"state": "working"}
+        self.assertEqual(self.why(), "status working")
+        self.t["status"] = {"state": "done"}
+        self.screen = composer("❯\xa0не надіслано")
+        self.assertEqual(self.why(), "composer draft")
+        self.screen = composer("❯\xa0")
+        self.shown = ["-zsh"]
+        self.assertEqual(self.why(), "not shown in its classic pane")
+        self.shown = ["/x/herdr-sleep", "attach", "build-x"]
+        (hs.SESSIONS / "100.json").write_text(json.dumps({"pid": 100, "sessionId": "other", "parkedJobId": "j"}))
+        self.assertEqual(self.why(), "background Claude job")
+        (hs.SESSIONS / "100.json").unlink()
+        hs.EXCLUDE_CWDS = {self.cwd}
+        self.assertEqual(self.why(), "excluded")
+        hs.EXCLUDE_CWDS = set()
+        self.t["created_ms"] = int((time.time() - 300) * 1000)
+        self.assertEqual(self.why(), "woken 0.1 h ago")
+        del self.t["created_ms"]
+        self.t["keep"] = True
+        self.assertEqual(self.why(), "kept or shell-hosted terminal")
+        self.t["keep"] = False
+        del self.t["labels"]["classic_pane"]
+        self.assertEqual(self.why(), "no claude_session or classic_pane label")
 
 
 if __name__ == "__main__":
