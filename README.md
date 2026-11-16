@@ -131,6 +131,7 @@ When a [Herdr Core](https://herdr.dev) (`hc`) runs on the machine, started by la
 
 - Claude Code only. Other agent kinds are left alone.
 - Herdr Core support is tested on hc 0.1.21 on macOS; `hc ls` shows no labels, so the plugin filters with `--label`.
+- Terminals of another machine added with `hc machine add` (`machine/tN` in `hc ls`) are never put to sleep. `herdr-sleep attach` also runs on a Linux host, where the core's socket is in `$XDG_RUNTIME_DIR/herdr-core/`.
 - Depends on Herdr's CLI fields (`agent_session`, `foreground_cwd`, `state_change_seq`) and on Claude Code's transcript format and footer text; a change there makes agents stay awake, not break.
 - A small window remains between the last check and `SIGTERM`; Claude discards an unsent draft on exit, which is why a non-empty composer is a hard stop.
 - The project lines are written when the agent falls asleep and do not follow later changes to the project.
