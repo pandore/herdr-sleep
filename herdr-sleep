@@ -75,7 +75,9 @@ STATE = Path(os.path.expanduser("~/.local/state/herdr-sleep"))
 JOURNAL = STATE / "sleeping.json"
 PROJECTS = Path(os.path.expanduser("~/.claude/projects"))
 SESSIONS = Path(os.path.expanduser("~/.claude/sessions"))  # Claude's own record of each running claude
-CORE_SOCKET = Path(os.environ.get("HC_SOCKET") or os.path.expanduser("~/.local/state/herdr-core/default/default.sock"))
+CORE_SOCKET = Path(os.environ.get("HC_SOCKET") or (  # Linux keeps it in the runtime dir
+    f"{os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'}/herdr-core/default.sock"
+    if sys.platform.startswith("linux") else os.path.expanduser("~/.local/state/herdr-core/default/default.sock")))
 HC = shutil.which("hc") or os.path.expanduser("~/.local/bin/hc")
 SELF = os.path.realpath(__file__)
 SHELLS = {"zsh", "bash", "sh", "fish"}
