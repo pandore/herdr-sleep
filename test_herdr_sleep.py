@@ -44,6 +44,10 @@ class ReplayArgv(unittest.TestCase):
         self.assertEqual(hs.replay_argv(argv), (["claude", "--allow-dangerously-skip-permissions", "--effort", "max",
                                                  "--model=sonnet", "--allowed-tools", "Read", "mcp__x__y",
                                                  "--permission-mode", "auto"], None))
+        started = ["claude", "--allow-dangerously-skip-permissions", "--session-id", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                   "--model", "claude-opus-5-5"]  # how core-switch launch starts an agent
+        self.assertEqual(hs.replay_argv(started)[0], ["claude", "--allow-dangerously-skip-permissions", "--model",
+                                                      "claude-opus-5-5"])
 
     def test_refuses_what_cannot_be_replayed(self):
         for argv in (["claude", "fix the bug"], ["claude", "-p", "x"], ["claude", "--fork-session"],
@@ -181,7 +185,9 @@ class WhyAwake(unittest.TestCase):
         project.mkdir(parents=True)
         self.path = project / f"{SID}.jsonl"
         self.write_turn(hours_ago=30)
-        self.saved = {k: getattr(hs, k) for k in ("PROJECTS", "SESSIONS", "herdr", "ps_table", "screen", "tree_rss_mb")}
+        self.saved = {k: getattr(hs, k) for k in ("PROJECTS", "SESSIONS", "herdr", "ps_table", "screen", "tree_rss_mb",
+                                                 "classic_up")}
+        hs.classic_up = lambda: True
         hs.PROJECTS = Path(self.tmp.name) / "projects"
         hs.SESSIONS = Path(self.tmp.name) / "sessions"
         hs.SESSIONS.mkdir()
@@ -263,7 +269,8 @@ class LiveElsewhere(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = {"SESSIONS": hs.SESSIONS, "agents_now": hs.agents_now, "run": hs.subprocess.run,
-                      "core_running": hs.core_running}
+                      "core_running": hs.core_running, "classic_up": hs.classic_up}
+        hs.classic_up = lambda: True
         hs.core_running = lambda: self.core
         hs.SESSIONS = Path(self.tmp.name)
         self.ps, self.core, self.terminals, self.hc_fails, self.calls = "claude --resume x", False, [], False, []
@@ -287,6 +294,7 @@ class LiveElsewhere(unittest.TestCase):
     def tearDown(self):
         hs.SESSIONS, hs.agents_now, hs.subprocess.run = self.saved["SESSIONS"], self.saved["agents_now"], self.saved["run"]
         hs.core_running = self.saved["core_running"]
+        hs.classic_up = self.saved["classic_up"]
         self.tmp.cleanup()
 
     def session_file(self, pid, sid=SID, raw=None):
@@ -387,16 +395,22 @@ class CoreSleep(unittest.TestCase):
         project.mkdir(parents=True)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 30 * 3600))
         (project / f"{SID}.jsonl").write_text(json.dumps({"type": "user", "timestamp": stamp, "message": {"content": "x"}}, separators=(",", ":")) + "\n")
-        keys = ("PROJECTS", "SESSIONS", "herdr", "ps_table", "screen", "tree_rss_mb", "EXCLUDE_CWDS")
+        keys = ("PROJECTS", "SESSIONS", "herdr", "ps_table", "screen", "tree_rss_mb", "EXCLUDE_CWDS", "classic_up",
+                "hc_screen")
         self.saved = {k: getattr(hs, k) for k in keys}
         hs.PROJECTS, hs.SESSIONS = Path(self.tmp.name) / "projects", Path(self.tmp.name) / "sessions"
         hs.SESSIONS.mkdir()
         hs.EXCLUDE_CWDS = set()
+        self.classic = True
+        hs.classic_up = lambda: self.classic
+        hs.hc_screen = lambda addr: self.screen
         self.shown = ["/x/herdr-sleep", "attach", "build-x"]
         self.focused = False
+        self.pane_exists = True
         def herdr(*a, **k):
             if a[:2] == ("pane", "get"):
-                return {"pane": {"pane_id": "w4:p8", "tab_id": "w4:t8", "workspace_id": "w4", "focused": self.focused}}
+                return {"pane": {"pane_id": "w4:p8", "tab_id": "w4:t8", "workspace_id": "w4", "focused": self.focused}} \
+                    if self.pane_exists else {}
             if a[:2] == ("pane", "process-info"):
                 return {"process_info": {"foreground_processes": [{"argv": self.shown}]}}
             return {}
@@ -425,6 +439,22 @@ class CoreSleep(unittest.TestCase):
         self.assertEqual((f["pane"], f["name"], f["pid"]), ("w4:p8", "build-x", 100))
         self.assertEqual(f["argv"], ["claude", "--allow-dangerously-skip-permissions"])  # resume flag dropped
 
+    def test_core_only_needs_no_classic_pane(self):
+        self.classic = False
+        del self.t["labels"]["classic_pane"]
+        self.t["labels"]["herdr.space"] = "sp1"
+        self.shown = ["-zsh"]  # no classic pane at all
+        reason, f = hs.why_awake_core(self.t, {})
+        self.assertIsNone(reason)
+        self.assertEqual((f["pane"], f["space"]), (None, "sp1"))
+        self.screen = composer("❯\xa0чернетка")
+        self.assertEqual(self.why(), "composer draft")  # hc read has no colours: any text keeps it awake
+
+    def test_empty_classic_server_changes_nothing(self):
+        self.pane_exists = False  # classic runs again (an app started it) but the agent's pane is long gone
+        self.shown = ["-zsh"]
+        self.assertIsNone(self.why())  # judged as Core only, not "classic pane gone"
+
     def test_stays_awake(self):
         self.focused = True
         self.assertEqual(self.why(), "focused")
@@ -449,10 +479,12 @@ class CoreSleep(unittest.TestCase):
         self.assertEqual(self.why(), "woken 0.1 h ago")
         del self.t["created_ms"]
         self.t["keep"] = True
-        self.assertEqual(self.why(), "kept or shell-hosted terminal")
-        self.t["keep"] = False
-        del self.t["labels"]["classic_pane"]
-        self.assertEqual(self.why(), "no claude_session or classic_pane label")
+        self.assertIsNone(self.why())  # the Herdr app keeps its terminals: sleep turns keep off first
+        self.t["pid"] = 999
+        self.assertEqual(self.why(), "shell-hosted terminal")
+        del self.t["pid"]
+        del self.t["labels"]["claude_session"]
+        self.assertEqual(self.why(), "no claude_session label")
 
 
 class ClassicState(unittest.TestCase):
