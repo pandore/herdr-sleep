@@ -455,5 +455,14 @@ class CoreSleep(unittest.TestCase):
         self.assertEqual(self.why(), "no claude_session or classic_pane label")
 
 
+class ClassicState(unittest.TestCase):
+    def test_core_status_for_the_classic_sidebar(self):
+        self.assertEqual(hs.classic_state({"state": "working"}), "working")
+        self.assertEqual(hs.classic_state({"state": "done"}), "idle")  # classic works out done itself
+        self.assertEqual(hs.classic_state({"state": "blocked", "kind": "permission"}), "blocked")
+        self.assertEqual(hs.classic_state({"state": "error"}), "unknown")
+        self.assertEqual(hs.classic_state(None), "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()

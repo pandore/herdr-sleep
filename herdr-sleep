@@ -32,6 +32,7 @@ import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -1107,7 +1108,65 @@ def core_pid() -> int | None:
         return None
 
 
+CORE_SOURCE = "custom:herdr-core"
+CORE_LABEL = "claude-core"  # classic Herdr ignores reports labelled "claude": it detects claude by process
+
+
+def classic_state(status: dict | None) -> str:
+    """Herdr Core's word for a claude, as classic Herdr's sidebar takes it (it works out 'done' itself)."""
+    return {"idle": "idle", "done": "idle", "working": "working", "blocked": "blocked"}.get((status or {}).get("state"),
+                                                                                           "unknown")
+
+
+def mirror_status(addr: str, pane: str, stop: threading.Event) -> None:
+    """Classic Herdr sees only `hc attach` in the pane: report the Core claude's name and state for its sidebar."""
+    shown, seq = None, time.time_ns()  # Herdr drops reports older than the last seq it saw for this pane and source
+    while not stop.wait(4):
+        try:
+            if not core_running():
+                continue
+            got = subprocess.run([HC, "get", addr, "--json"], capture_output=True, text=True, timeout=10)
+            t = json.loads(got.stdout) if got.returncode == 0 else {}
+        except Exception:
+            continue
+        if t.get("state") != "live" or (t.get("status") or {}).get("app") != "claude-code":
+            if shown:  # a sleeping page or an ended agent: leave the row to whoever owns it now
+                seq += 1
+                herdr("pane", "release-agent", pane, "--source", CORE_SOURCE, "--agent", CORE_LABEL,
+                      "--seq", str(seq), check=False)
+                shown = None
+            continue
+        sid = (t.get("labels") or {}).get("claude_session")
+        now = (classic_state(t.get("status")), sid, t.get("name") or addr)
+        if now == shown:
+            continue
+        seq += 1
+        herdr("pane", "report-agent", pane, "--source", CORE_SOURCE, "--agent", CORE_LABEL, "--state", now[0],
+              "--seq", str(seq), *(["--agent-session-id", sid] if sid else []), check=False)
+        herdr("pane", "report-metadata", pane, "--source", CORE_SOURCE, "--agent", CORE_LABEL,
+              "--display-agent", now[2], check=False)
+        shown = now
+    if shown:
+        herdr("pane", "release-agent", pane, "--source", CORE_SOURCE, "--agent", CORE_LABEL,
+              "--seq", str(time.time_ns()), check=False)
+        herdr("pane", "report-metadata", pane, "--source", CORE_SOURCE, "--clear-display-agent", check=False)
+
+
 def attach(addr: str) -> int:
+    pane = os.environ.get("HERDR_PANE_ID")
+    stop = threading.Event()
+    mirror = threading.Thread(target=mirror_status, args=(addr, pane, stop), daemon=True) if pane else None
+    if mirror:
+        mirror.start()
+    try:
+        return show_core(addr)
+    finally:
+        stop.set()
+        if mirror:
+            mirror.join(timeout=15)
+
+
+def show_core(addr: str) -> int:
     """Show a Herdr Core terminal in this pane. A core restart ends attach streams: attach again then.
     Ctrl-\\ (detach) with the same core running, or the terminal ending, gives the pane back."""
     retries = 0
