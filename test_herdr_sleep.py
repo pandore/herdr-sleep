@@ -311,8 +311,8 @@ class LiveElsewhere(unittest.TestCase):
     def test_herdr_core_terminal_with_the_session_label(self):
         self.core = True
         self.terminals = [{"address": "t1", "name": "other", "labels": {"claude_session": "x"}},
-                          {"address": "t2", "name": "build-limb-community-owner", "labels": {"claude_session": SID}}]
-        self.assertEqual(hs.live_elsewhere(SID), "термінал Herdr Core build-limb-community-owner")
+                          {"address": "t2", "name": "build-blog-owner", "labels": {"claude_session": SID}}]
+        self.assertEqual(hs.live_elsewhere(SID), "термінал Herdr Core build-blog-owner")
         self.terminals = [{"address": "t3", "labels": {"claude_session": SID}}]
         self.assertEqual(hs.live_elsewhere(SID), "термінал Herdr Core t3")  # unnamed: its address
         self.terminals = [{"address": "t4"}]
