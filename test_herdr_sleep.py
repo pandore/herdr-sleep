@@ -310,11 +310,21 @@ class LiveElsewhere(unittest.TestCase):
 
     def test_herdr_core_terminal_with_the_session_label(self):
         self.core = True
-        self.terminals = [{"address": "t1", "name": "other", "labels": {"claude_session": "x"}},
-                          {"address": "t2", "name": "build-blog-owner", "labels": {"claude_session": SID}}]
+        self.terminals = [{"address": "t1", "name": "other", "agent": "claude-code", "labels": {"claude_session": "x"}},
+                          {"address": "t2", "name": "build-blog-owner", "agent": "claude-code", "labels": {"claude_session": SID}}]
         self.assertEqual(hs.live_elsewhere(SID), "термінал Herdr Core build-blog-owner")
-        self.terminals = [{"address": "t3", "labels": {"claude_session": SID}}]
+        self.terminals = [{"address": "t3", "agent": "claude-code", "labels": {"claude_session": SID}}]
         self.assertEqual(hs.live_elsewhere(SID), "термінал Herdr Core t3")  # unnamed: its address
+        self.terminals = [{"address": "t5", "name": "s-11111111", "agent": "zsh", "labels": {"claude_session": SID}}]
+        self.assertEqual(hs.live_elsewhere(SID), "сторінка сну в Herdr Core s-11111111")  # no agent: its page
+        saved_env = os.environ.get("HC_TERMINAL_ID")
+        os.environ["HC_TERMINAL_ID"] = "t5"
+        try:
+            self.assertIsNone(hs.live_elsewhere(SID))  # the page running in that terminal does not block itself
+        finally:
+            os.environ.pop("HC_TERMINAL_ID")
+            if saved_env:
+                os.environ["HC_TERMINAL_ID"] = saved_env
         self.terminals = [{"address": "t4"}]
         self.assertIsNone(hs.live_elsewhere(SID))
         self.session_file(os.getpid())  # core up and a live claude: the process wins, hc is not needed

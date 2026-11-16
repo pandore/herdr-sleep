@@ -854,7 +854,7 @@ def put_to_sleep(pane: str, tab_id: str | None, name: str | None, workspace_id: 
     claim(pane, rec)
     if rec["tab_id"]:
         mark_tab(rec["tab_id"])
-    show_page(pane, sid)
+    show_sleeping(pane, sid, rec)
     log(f"slept {name or pane} {sid} after {f['quiet']:.1f} h, ~{f['rss']} MB RSS")
     return None
 
@@ -864,7 +864,13 @@ def forget_awake(agents: list[dict]) -> None:
     live = {session_of(x) for x in agents if x.get("agent") == "claude"}
     with locked():
         data = load()
-        woke = [s for s in data if s in live]
+
+        def held(s):
+            try:
+                return claude_process_of(s) is not None
+            except Exception:
+                return False
+        woke = [s for s in data if s in live or held(s)]
         for sid in woke:
             rec = data.pop(sid)
             if rec.get("tab_id"):
@@ -1024,8 +1030,8 @@ def core_ok() -> bool:
     return any(" --hc-launchd " in f" {line} " for line in out.splitlines())
 
 
-def live_elsewhere(sid: str) -> str | None:
-    """Where the session already runs outside this Herdr: a live claude process or a Herdr Core terminal."""
+def claude_process_of(sid: str) -> int | None:
+    """The live claude process that holds this session, from Claude's own ~/.claude/sessions records."""
     for f in SESSIONS.glob("*.json"):
         d = None
         for _ in range(2):  # claude may be writing the file right now
@@ -1049,13 +1055,33 @@ def live_elsewhere(sid: str) -> str | None:
             continue  # a stale file whose pid now belongs to another program
         if d.get("procStart") and ps_field(pid, "lstart") != " ".join(str(d["procStart"]).split()):
             continue  # same pid, a later claude: not this session's process
+        return pid
+    return None
+
+
+def core_terminals_of(sid: str) -> list[dict]:
+    """Live Core terminals carrying this session (an agent or its sleeping page), except the one we run in."""
+    if not core_running():
+        return []
+    # `hc ls` shows no labels; it filters by them.
+    out = subprocess.run([HC, "ls", "--label", f"claude_session={sid}", "--json"], capture_output=True, text=True,
+                         timeout=20, check=True).stdout
+    me = os.environ.get("HC_TERMINAL_ID")
+    return [t for t in json.loads(out).get("terminals") or [] if t.get("address") != me]
+
+
+def is_agent(t: dict) -> bool:
+    return t.get("agent") == "claude-code"  # hc names any program here; a sleeping page shows as zsh
+
+
+def live_elsewhere(sid: str) -> str | None:
+    """Where the session already runs or sleeps outside this page: a live claude process or a Herdr Core terminal."""
+    pid = claude_process_of(sid)
+    if pid:
         return f"процес {pid}"
-    if core_running():
-        # `hc ls` shows no labels; it filters by them.
-        out = subprocess.run([HC, "ls", "--label", f"claude_session={sid}", "--json"], capture_output=True, text=True,
-                             timeout=20, check=True).stdout
-        for t in json.loads(out).get("terminals") or []:
-            return f"термінал Herdr Core {t.get('name') or t.get('address')}"
+    for t in core_terminals_of(sid):
+        name = t.get("name") or t.get("address")
+        return f"термінал Herdr Core {name}" if is_agent(t) else f"сторінка сну в Herdr Core {name}"
     return None
 
 
@@ -1136,9 +1162,7 @@ def wake_in_core(rec: dict, sid: str) -> str:
 
 def core_terminal_of(sid: str) -> str | None:
     """The live Core terminal that carries this session, if any. Call only when core_running()."""
-    out = subprocess.run([HC, "ls", "--label", f"claude_session={sid}", "--json"], capture_output=True, text=True,
-                         timeout=20, check=True).stdout
-    t = next(iter(json.loads(out).get("terminals") or []), None)
+    t = next((x for x in core_terminals_of(sid) if is_agent(x)), None)  # an agent, not another sleeping page
     return (t.get("name") or t.get("address")) if t else None
 
 
@@ -1173,6 +1197,28 @@ def wake_problem(rec: dict, sid: str) -> str | None:
     if not os.path.isdir(rec["cwd"]):
         return f"Теки {rec['cwd']} більше немає."
     return None
+
+
+def show_sleeping(pane: str, sid: str, rec: dict) -> None:
+    """Show the sleeping page as a Herdr Core terminal (the phone and Sheprd see it), attached in the classic pane.
+    Without a usable core, the page runs in the classic pane itself, as before."""
+    if core_ok():
+        try:
+            mine = next((t for t in core_terminals_of(sid) if not is_agent(t)), None)
+            addr = (mine.get("name") or mine.get("address")) if mine else None
+            if not addr:
+                name = rec.get("name") if re.fullmatch(r"[a-z0-9_-]{1,32}", rec.get("name") or "") else f"s-{sid[:8]}"
+                page_cmd = f"exec {shlex.quote(sys.executable)} {shlex.quote(SELF)} page {sid}"
+                out = subprocess.run([HC, "run", "--bg", "--no-parent", "--json", "--name", name, "--cwd", rec["cwd"],
+                                      "--label", f"claude_session={sid}", "--label", f"classic_pane={pane}",
+                                      "--", "/bin/zsh", "-l", "-c", page_cmd],
+                                     capture_output=True, text=True, timeout=60, check=True).stdout
+                addr = json.loads(out).get("name") or json.loads(out)["address"]
+            herdr("pane", "run", pane, f"{shlex.quote(SELF)} attach {shlex.quote(addr)}", check=False)
+            return
+        except Exception as exc:
+            log(f"sleeping page in Core failed for {sid}: {exc!r}; showing it in the classic pane")
+    show_page(pane, sid)
 
 
 def release(pane: str, rec: dict, sid: str) -> None:
@@ -1243,6 +1289,8 @@ def page(sid: str) -> int:
         if not transcript(sid) and Path(rec["backup"]).exists():
             Path(rec["transcript"]).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(rec["backup"], rec["transcript"])
+        if os.environ.get("HC_TERMINAL_ID"):
+            break  # this page runs in Herdr Core: claude takes over this very terminal (name, labels, viewers)
         if not core_ok():
             if core_tried:  # Core may still be starting that wake: a classic wake now could make a second copy
                 print("Herdr Core перезапускається або не працює. Натисни Enter за кілька секунд.")
@@ -1269,8 +1317,11 @@ def page(sid: str) -> int:
     tab_id = ((herdr("pane", "get", pane, check=False) or {}).get("pane") or {}).get("tab_id") or rec.get("tab_id")
     with locked():
         unmark_tab(tab_id, load(), sid)
-    subprocess.Popen([sys.executable, SELF, "after-wake", pane, sid], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.environ.get("HC_TERMINAL_ID"):
+        log(f"woke {rec.get('name') or pane} {sid} in its Herdr Core terminal")  # the sweep drops the record
+    else:
+        subprocess.Popen([sys.executable, SELF, "after-wake", pane, sid], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.chdir(rec["cwd"])
     argv = rec["argv"] + ["--resume", sid]
     try:
@@ -1324,7 +1375,7 @@ def rearm() -> None:
         if not fg or any(os.path.basename((p.get("argv") or ["?"])[0]).lstrip("-") not in SHELLS for p in fg):
             continue  # something other than a bare shell runs there, or we cannot tell
         claim(pane, rec)
-        show_page(pane, sid)
+        show_sleeping(pane, sid, rec)
         log(f"re-armed {rec.get('name') or pane} {sid}")
     slept_panes = {r["pane_id"] for r in data.values()}
     for t in core_claudes():  # after a classic restart, panes that showed Core agents are bare shells again
@@ -1346,7 +1397,8 @@ def ensure() -> int:
         except BlockingIOError:
             return 0  # a watcher holds it
     out = open(STATE / "watcher.out", "a")
-    subprocess.Popen([sys.executable, SELF, "watch"], start_new_session=True,
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("HC_TERMINAL", "HERDR_PANE", "HERDR_TAB"))}
+    subprocess.Popen([sys.executable, SELF, "watch"], start_new_session=True, env=env,  # not tied to the caller's terminal
                      stdin=subprocess.DEVNULL, stdout=out, stderr=out)
     return 0
 
@@ -1375,6 +1427,11 @@ def refresh() -> int:
         info = (herdr("pane", "process-info", "--pane", rec["pane_id"], check=False) or {}).get("process_info") or {}
         if any((p.get("argv") or [])[-2:] == ["page", sid] for p in info.get("foreground_processes") or []):
             herdr("pane", "send-keys", rec["pane_id"], "ctrl+c", check=False)  # only our own page, never anything else
+        for t in core_terminals_of(sid):
+            if not is_agent(t):  # its sleeping page in Core: end it, rearm starts it again with this code
+                addr = t.get("name") or t["address"]
+                subprocess.run([HC, "kill", addr], capture_output=True, timeout=20)
+                subprocess.run([HC, "rm", addr], capture_output=True, timeout=20)
     time.sleep(2)
     rearm()
     return 0
