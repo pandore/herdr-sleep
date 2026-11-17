@@ -909,8 +909,9 @@ def put_to_sleep(pane: str, tab_id: str | None, name: str | None, workspace_id: 
     return None
 
 
-def forget_awake(agents: list[dict]) -> None:
-    """Drop records whose session runs again, however it was woken."""
+def forget_awake(agents: list[dict], core_names: set | frozenset = frozenset()) -> None:
+    """Drop records whose session runs again, however it was woken. A Core terminal of the record's name that runs
+    claude also counts: after /clear it holds another session, and the old one never runs again."""
     live = {session_of(x) for x in agents if x.get("agent") == "claude"}
     with locked():
         data = load()
@@ -920,7 +921,7 @@ def forget_awake(agents: list[dict]) -> None:
                 return claude_process_of(s) is not None
             except Exception:
                 return False
-        woke = [s for s in data if s in live or held(s)]
+        woke = [s for s in data if s in live or data[s].get("name") in core_names or held(s)]
         for sid in woke:
             rec = data.pop(sid)
             if rec.get("tab_id"):
@@ -939,8 +940,10 @@ def sweep(dry_run: bool = False) -> int:
         classic = classic_up()
         agents = agents_now() if classic else []
         tabs = {t["tab_id"]: t for t in herdr("tab", "list")["tabs"]} if classic else {}
+        core = core_claudes()
+        follow_sessions(core, dry_run)
         if not dry_run:
-            forget_awake(agents)
+            forget_awake(agents, {t.get("name") for t in core if t.get("name")})
         for a in agents:
             name = a.get("name") or a.get("pane_id")
             try:
@@ -953,7 +956,7 @@ def sweep(dry_run: bool = False) -> int:
                 log(f"error on {name}: {exc!r}")
                 if dry_run:
                     print(f"{name:30} error {exc!r}")
-        for t in core_claudes():
+        for t in core:
             name = t.get("name") or t.get("address")
             try:
                 if dry_run:
@@ -966,6 +969,26 @@ def sweep(dry_run: bool = False) -> int:
                 if dry_run:
                     print(f"{name:30} error {exc!r} [Core]")
     return 0
+
+
+def follow_sessions(core: list[dict], dry_run: bool = False) -> None:
+    """/clear or /resume inside an agent gives its claude another session: move the claude_session label to it, so
+    sleep measures and resumes the conversation that runs now. Terminals without the label are not ours."""
+    for t in core:
+        labels = t.get("labels") or {}
+        old, pid = labels.get("claude_session"), (t.get("foreground") or {}).get("pid")
+        try:
+            now = json.loads((SESSIONS / f"{pid}.json").read_text()).get("sessionId")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not old or not now or now == old:
+            continue
+        if not dry_run:
+            if subprocess.run([HC, "label", t["address"], f"claude_session={now}"], capture_output=True,
+                              timeout=20).returncode != 0:
+                continue
+            log(f"session of {t.get('name') or t['address']} is now {now} (was {old})")
+        labels["claude_session"] = now
 
 
 def core_claudes() -> list[dict]:

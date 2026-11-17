@@ -496,8 +496,44 @@ class ClassicState(unittest.TestCase):
         self.assertEqual(hs.classic_state(None), "unknown")
 
 
-if __name__ == "__main__":
-    unittest.main()
+class AfterClear(unittest.TestCase):
+    """/clear inside an awake agent gives its claude a new session: the label follows it, the old record goes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        keys = ("STATE", "JOURNAL", "SESSIONS", "claude_process_of", "unmark_tab")
+        self.saved = {k: getattr(hs, k) for k in keys} | {"run": hs.subprocess.run}
+        hs.STATE = Path(self.tmp.name)
+        hs.JOURNAL, hs.SESSIONS = hs.STATE / "sleeping.json", hs.STATE / "sessions"
+        hs.SESSIONS.mkdir()
+        hs.claude_process_of = lambda sid: None  # nothing holds the pre-/clear session any more
+        hs.unmark_tab = lambda *a: None
+        self.calls = []
+        hs.subprocess.run = lambda argv, **kw: self.calls.append(argv) or hs.subprocess.CompletedProcess(argv, 0, "", "")
+        (hs.SESSIONS / "100.json").write_text(json.dumps({"pid": 100, "sessionId": "new-sid"}))
+        self.t = {"address": "t2c", "name": "drafts", "labels": {"claude_session": "old-sid"}, "foreground": {"pid": 100}}
+
+    def tearDown(self):
+        hs.subprocess.run = self.saved.pop("run")
+        for k, v in self.saved.items():
+            setattr(hs, k, v)
+        self.tmp.cleanup()
+
+    def test_label_follows_the_live_session(self):
+        hs.follow_sessions([self.t])
+        self.assertEqual(self.t["labels"]["claude_session"], "new-sid")
+        self.assertEqual(self.calls, [[hs.HC, "label", "t2c", "claude_session=new-sid"]])
+        hs.follow_sessions([self.t])  # already right: no second call
+        self.assertEqual(len(self.calls), 1)
+        helper = {"address": "t9", "labels": {}, "foreground": {"pid": 100}}  # no label: not an agent of ours
+        hs.follow_sessions([helper])
+        self.assertEqual(helper["labels"], {})
+
+    def test_record_of_an_awake_core_terminal_is_dropped(self):
+        hs.save({"old-sid": {"name": "drafts", "pane_id": "w4:p1"}, "s2": {"name": "asleep", "pane_id": "w4:p8"}})
+        hs.forget_awake([], {"drafts", "other"})
+        self.assertEqual(list(hs.load()), ["s2"])
+
 
 
 class CoreClaudes(unittest.TestCase):
@@ -517,3 +553,7 @@ class CoreClaudes(unittest.TestCase):
             self.assertEqual([t["address"] for t in hs.core_claudes()], ["t1"])
         finally:
             hs.core_ok, hs.core_running, hs.subprocess.run = saved
+
+
+if __name__ == "__main__":
+    unittest.main()
