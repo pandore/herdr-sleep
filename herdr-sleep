@@ -971,16 +971,41 @@ def sweep(dry_run: bool = False) -> int:
     return 0
 
 
+def continued_in(sid: str, job: str) -> str | None:
+    """Claude's background mode (←) goes on with the conversation under a new id; the old transcript names it in a
+    continued-in entry near its end (only the tail is read: transcripts run to megabytes)."""
+    path = transcript(sid)
+    if not path or not job:
+        return None
+    with open(path, "rb") as f:
+        f.seek(max(0, f.seek(0, 2) - 65536))
+        tail = f.read().decode("utf-8", "replace")
+    found = None
+    for line in tail.splitlines():
+        if '"continued-in"' in line:
+            try:
+                new = json.loads(line).get("continuedInSessionId") or ""
+            except ValueError:
+                continue
+            if new.startswith(job) and UUID.match(new):
+                found = new
+    return found
+
+
 def follow_sessions(core: list[dict], dry_run: bool = False) -> None:
-    """/clear or /resume inside an agent gives its claude another session: move the claude_session label to it, so
-    sleep measures and resumes the conversation that runs now. Terminals without the label are not ours."""
+    """/clear or /resume inside an agent gives its claude another session, and background mode (←) moves the
+    conversation into Claude's daemon under a new id: move the claude_session label to the conversation that goes on,
+    so sleep, close and restore use it. Terminals without the label are not ours."""
     for t in core:
         labels = t.get("labels") or {}
         old, pid = labels.get("claude_session"), (t.get("foreground") or {}).get("pid")
         try:
-            now = json.loads((SESSIONS / f"{pid}.json").read_text()).get("sessionId")
+            rec = json.loads((SESSIONS / f"{pid}.json").read_text())
+            now = rec.get("sessionId")
         except (OSError, ValueError, AttributeError):
             continue
+        if now and rec.get("parkedJobId"):
+            now = continued_in(now, rec["parkedJobId"]) or now
         if not old or not now or now == old:
             continue
         if not dry_run:

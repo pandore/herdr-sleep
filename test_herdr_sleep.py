@@ -529,6 +529,28 @@ class AfterClear(unittest.TestCase):
         hs.follow_sessions([helper])
         self.assertEqual(helper["labels"], {})
 
+    def test_label_follows_background_mode(self):
+        old, new, other = ("aaaa1111-0000-4000-8000-000000000001", "bbbb2222-0000-4000-8000-000000000002",
+                           "77777777-0000-4000-8000-000000000003")
+        saved = hs.PROJECTS
+        hs.PROJECTS = hs.STATE / "projects"
+        (hs.PROJECTS / "p").mkdir(parents=True)
+        rows = [{"type": "user", "message": {"content": "x" * 70000}},  # the tail read must still find the entry
+                {"type": "continued-in", "sessionId": old, "continuedInSessionId": other},
+                {"type": "continued-in", "sessionId": old, "continuedInSessionId": new}]
+        (hs.PROJECTS / "p" / f"{old}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        try:
+            (hs.SESSIONS / "100.json").write_text(json.dumps({"pid": 100, "sessionId": old, "parkedJobId": "bbbb2222"}))
+            self.t["labels"]["claude_session"] = old
+            hs.follow_sessions([self.t])
+            self.assertEqual(self.t["labels"]["claude_session"], new)
+            (hs.SESSIONS / "100.json").write_text(json.dumps({"pid": 100, "sessionId": old, "parkedJobId": "deadbeef"}))
+            self.t["labels"]["claude_session"] = old
+            hs.follow_sessions([self.t])  # no entry for this job: the label stays
+            self.assertEqual(self.t["labels"]["claude_session"], old)
+        finally:
+            hs.PROJECTS = saved
+
     def test_record_of_an_awake_core_terminal_is_dropped(self):
         hs.save({"old-sid": {"name": "drafts", "pane_id": "w4:p1"}, "s2": {"name": "asleep", "pane_id": "w4:p8"}})
         hs.forget_awake([], {"drafts", "other"})
